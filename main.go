@@ -58,11 +58,10 @@ func main() {
 		flag.Usage()
 		return
 	}
-
 	// 显示版本信息
 	if showVersion {
 		fmt.Println("Docker Image Sync Tool v1.0.0")
-		fmt.Println("基于containers/image/v5库的Docker镜像同步工具")
+		fmt.Println("基于go-containerregistry库的Docker镜像同步工具")
 		return
 	}
 

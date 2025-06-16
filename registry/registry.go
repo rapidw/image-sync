@@ -11,22 +11,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/image/v5/copy"
-	"github.com/containers/image/v5/docker"
-	"github.com/containers/image/v5/manifest"
-	"github.com/containers/image/v5/signature"
-	"github.com/containers/image/v5/transports/alltransports"
-	"github.com/containers/image/v5/types"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/rapidw/image-sync/config"
 )
 
 // RegistryClient 包装Docker注册表客户端
 type RegistryClient struct {
-	sysCtx       *types.SystemContext
-	registryURL  string
-	registryType string
-	apiURL       string
-	insecure     bool
+	authenticator authn.Authenticator
+	options       []remote.Option
+	registryURL   string
+	registryType  string
+	apiURL        string
+	insecure      bool
 }
 
 // ImageInfo 存储镜像信息
@@ -79,34 +77,41 @@ func NewRegistryClient(config config.RegistryConfig) (*RegistryClient, error) {
 		url = "https://" + url
 	}
 
-	sysCtx := &types.SystemContext{}
+	var authenticator authn.Authenticator
+	var options []remote.Option
 
 	// 配置认证
 	if config.Auth.Username != "" && config.Auth.Password != "" {
-		sysCtx.DockerAuthConfig = &types.DockerAuthConfig{
+		authenticator = &authn.Basic{
 			Username: config.Auth.Username,
 			Password: config.Auth.Password,
 		}
 		log.Printf("为注册表 %s 配置了用户名/密码认证 (用户: %s)", url, config.Auth.Username)
 	} else if config.Auth.Token != "" {
-		sysCtx.DockerBearerRegistryToken = config.Auth.Token
+		authenticator = &authn.Bearer{
+			Token: config.Auth.Token,
+		}
 		log.Printf("为注册表 %s 配置了Bearer Token认证", url)
 	} else {
+		authenticator = authn.Anonymous
 		log.Printf("注册表 %s 使用匿名访问", url)
 	}
 
+	options = append(options, remote.WithAuth(authenticator))
+
 	// 配置不安全连接
 	if config.Insecure {
-		sysCtx.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
-		sysCtx.DockerDaemonInsecureSkipTLSVerify = true
+		options = append(options, remote.WithTransport(remote.DefaultTransport))
 		log.Printf("为注册表 %s 启用了不安全连接（跳过TLS验证）", url)
 	}
+
 	return &RegistryClient{
-		sysCtx:       sysCtx,
-		registryURL:  url,
-		registryType: config.Type,
-		apiURL:       config.ApiURL,
-		insecure:     config.Insecure,
+		authenticator: authenticator,
+		options:       options,
+		registryURL:   url,
+		registryType:  config.Type,
+		apiURL:        config.ApiURL,
+		insecure:      config.Insecure,
 	}, nil
 }
 
@@ -277,11 +282,17 @@ func (r *RegistryClient) getNewestTagFromHarborAPI(image string) (string, time.T
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("创建HTTP请求失败: %v", err)
 	}
-
 	// 添加认证头（如果有）
-	if r.sysCtx.DockerAuthConfig != nil {
-		// Harbor通常使用Basic认证
-		req.SetBasicAuth(r.sysCtx.DockerAuthConfig.Username, r.sysCtx.DockerAuthConfig.Password)
+	if r.authenticator != authn.Anonymous {
+		authConfig, err := r.authenticator.Authorization()
+		if err == nil {
+			if authConfig.Username != "" && authConfig.Password != "" {
+				// Harbor通常使用Basic认证
+				req.SetBasicAuth(authConfig.Username, authConfig.Password)
+			} else if authConfig.RegistryToken != "" {
+				req.Header.Set("Authorization", "Bearer "+authConfig.RegistryToken)
+			}
+		}
 	}
 
 	// 发送HTTP请求
@@ -390,18 +401,28 @@ func (r *RegistryClient) GetNewestTag(image string) (string, time.Time, error) {
 // getNewestTagFromManifest 通过镜像清单获取最新标签（传统方式）
 func (r *RegistryClient) getNewestTagFromManifest(image string) (string, time.Time, error) {
 	// 构建镜像引用
-	imageRef := fmt.Sprintf("docker://%s", image)
+	var imageRef string
+
+	// 根据仓库类型构建引用
+	if r.registryType == "dockerhub" && (strings.Contains(r.registryURL, "docker.io") || strings.Contains(r.registryURL, "registry-1.docker.io")) {
+		imageRef = image
+	} else {
+		// 提取主机名
+		host := strings.TrimPrefix(r.registryURL, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		imageRef = fmt.Sprintf("%s/%s", host, image)
+	}
+
+	log.Printf("正在获取镜像 %s 的标签列表...", imageRef)
 
 	// 解析镜像引用
-	ref, err := alltransports.ParseImageName(imageRef)
+	repo, err := name.NewRepository(imageRef)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("解析镜像引用失败: %v", err)
 	}
 
-	log.Printf("正在获取镜像 %s 的标签列表...", image)
-
 	// 获取标签列表
-	tags, err := docker.GetRepositoryTags(context.Background(), r.sysCtx, ref)
+	tags, err := remote.List(repo, r.options...)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("获取标签列表失败: %v", err)
 	}
@@ -414,47 +435,40 @@ func (r *RegistryClient) getNewestTagFromManifest(image string) (string, time.Ti
 	var versions []VersionInfo
 
 	for _, tag := range tags {
-		taggedImageRef := fmt.Sprintf("docker://%s:%s", image, tag)
-		taggedRef, err := alltransports.ParseImageName(taggedImageRef)
+		taggedRef, err := name.ParseReference(fmt.Sprintf("%s:%s", imageRef, tag))
 		if err != nil {
-			log.Printf("警告: 解析标签引用 %s 失败: %v", taggedImageRef, err)
+			log.Printf("警告: 解析标签引用 %s 失败: %v", tag, err)
 			continue
 		}
 
-		// 获取镜像源
-		imgSrc, err := taggedRef.NewImageSource(context.Background(), r.sysCtx)
+		// 获取镜像配置
+		img, err := remote.Image(taggedRef, r.options...)
 		if err != nil {
-			log.Printf("警告: 创建镜像源 %s 失败: %v", taggedImageRef, err)
+			log.Printf("警告: 获取镜像 %s:%s 失败: %v", imageRef, tag, err)
 			continue
 		}
 
-		// 获取清单
-		manifestBlob, manifestType, err := imgSrc.GetManifest(context.Background(), nil)
+		// 获取配置文件
+		configFile, err := img.ConfigFile()
 		if err != nil {
-			imgSrc.Close()
-			log.Printf("警告: 获取清单 %s 失败: %v", taggedImageRef, err)
+			log.Printf("警告: 获取镜像 %s:%s 的配置文件失败: %v", imageRef, tag, err)
 			continue
 		}
 
-		// 解析清单
-		parsedManifest, err := manifest.FromBlob(manifestBlob, manifestType)
-		if err != nil {
-			imgSrc.Close()
-			log.Printf("警告: 解析清单 %s 失败: %v", taggedImageRef, err)
-			continue
-		}
-
-		// 尝试获取配置信息以获取创建时间
-		uploadTime, err := r.getImageCreationTime(imgSrc, parsedManifest, image, tag)
-		imgSrc.Close()
-
-		if err != nil {
-			log.Printf("警告: 获取镜像 %s:%s 的创建时间失败: %v", image, tag, err)
-			continue
+		// 获取创建时间
+		uploadTime := configFile.Created.Time
+		if uploadTime.IsZero() {
+			// 如果配置文件中没有创建时间，尝试从历史记录中获取最新时间
+			for _, h := range configFile.History {
+				if !h.Created.IsZero() && h.Created.After(uploadTime) {
+					uploadTime = h.Created.Time
+				}
+			}
 		}
 
 		if uploadTime.IsZero() {
-			return "", time.Time{}, fmt.Errorf("无法获取镜像 %s:%s 的上传时间，请检查代码中的时间提取逻辑是否适用于当前注册表", image, tag)
+			log.Printf("警告: 无法获取镜像 %s:%s 的创建时间", imageRef, tag)
+			continue
 		}
 
 		versions = append(versions, VersionInfo{
@@ -476,87 +490,27 @@ func (r *RegistryClient) getNewestTagFromManifest(image string) (string, time.Ti
 	return versions[0].Tag, versions[0].Timestamp, nil
 }
 
-// getImageCreationTime 从镜像配置中获取创建时间
-func (r *RegistryClient) getImageCreationTime(imgSrc types.ImageSource, parsedManifest manifest.Manifest, imageName, tag string) (time.Time, error) {
-	// 获取配置blob
-	configInfo := parsedManifest.ConfigInfo()
-	if configInfo.Digest == "" {
-		return time.Time{}, fmt.Errorf("清单中没有配置信息")
-	}
-	configBlob, _, err := imgSrc.GetBlob(context.Background(), configInfo, nil)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("获取配置blob失败: %v", err)
-	}
-	defer configBlob.Close()
-	// 读取配置数据
-	configData, err := io.ReadAll(configBlob)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("读取配置数据失败: %v", err)
-	}
-
-	// 解析配置JSON
-	var config struct {
-		Created string `json:"created"`
-		History []struct {
-			Created string `json:"created"`
-		} `json:"history"`
-	}
-
-	if err := json.Unmarshal(configData, &config); err != nil {
-		return time.Time{}, fmt.Errorf("解析配置JSON失败: %v", err)
-	}
-
-	// 尝试从配置的created字段获取时间
-	if config.Created != "" {
-		if t, err := time.Parse(time.RFC3339Nano, config.Created); err == nil {
-			return t, nil
-		} else if t, err := time.Parse(time.RFC3339, config.Created); err == nil {
-			return t, nil
-		}
-	}
-
-	// 如果配置中没有created字段，尝试从历史记录中获取最新时间
-	var latestTime time.Time
-	for _, h := range config.History {
-		if h.Created != "" {
-			if t, err := time.Parse(time.RFC3339Nano, h.Created); err == nil {
-				if t.After(latestTime) {
-					latestTime = t
-				}
-			} else if t, err := time.Parse(time.RFC3339, h.Created); err == nil {
-				if t.After(latestTime) {
-					latestTime = t
-				}
-			}
-		}
-	}
-
-	if !latestTime.IsZero() {
-		return latestTime, nil
-	}
-
-	// 打印配置信息用于调试
-	configJSON, _ := json.MarshalIndent(config, "", "  ")
-	log.Printf("警告: 镜像 %s:%s 的配置中没有找到有效的时间信息。配置结构: %s", imageName, tag, string(configJSON))
-
-	return time.Time{}, fmt.Errorf("配置中没有找到有效的时间信息")
-}
-
 // ImageExists 检查镜像是否存在
 func (r *RegistryClient) ImageExists(imageName string, tag string) bool {
-	imageRef := fmt.Sprintf("docker://%s:%s", imageName, tag)
-	ref, err := alltransports.ParseImageName(imageRef)
+	// 构建镜像引用
+	var imageRef string
+
+	// 根据仓库类型构建引用
+	if r.registryType == "dockerhub" && (strings.Contains(r.registryURL, "docker.io") || strings.Contains(r.registryURL, "registry-1.docker.io")) {
+		imageRef = fmt.Sprintf("%s:%s", imageName, tag)
+	} else {
+		// 提取主机名
+		host := strings.TrimPrefix(r.registryURL, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		imageRef = fmt.Sprintf("%s/%s:%s", host, imageName, tag)
+	}
+
+	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return false
 	}
 
-	imgSrc, err := ref.NewImageSource(context.Background(), r.sysCtx)
-	if err != nil {
-		return false
-	}
-	defer imgSrc.Close()
-
-	_, _, err = imgSrc.GetManifest(context.Background(), nil)
+	_, err = remote.Image(ref, r.options...)
 	return err == nil
 }
 
@@ -569,41 +523,25 @@ func (r *RegistryClient) RepositoryExists(imageName string) bool {
 
 // PullAndPushImage 从源注册表拉取镜像并推送到目标注册表
 func PullAndPushImage(ctx context.Context, sourceRegistry, destRegistry *RegistryClient, sourceImage, sourceTag, destImage, destTag string) error {
-	// 构建完整的镜像引用，包含仓库域名
+	// 构建完整的镜像引用
 	var srcImageRef, destImageRef string
-	var sourceHost, destHost string
 
 	// 构建源镜像引用
-	// 如果url以https开头，则去掉https
-	if strings.HasPrefix(sourceRegistry.registryURL, "https://") {
-		sourceHost = strings.TrimPrefix(sourceRegistry.registryURL, "https://")
-	}
-	// 如果url以http开头，则去掉http
-	if strings.HasPrefix(sourceRegistry.registryURL, "http://") {
-		sourceHost = strings.TrimPrefix(sourceRegistry.registryURL, "http://")
-	}
-	if sourceRegistry.registryType == "dockerhub" && (sourceHost == "registry-1.docker.io" || sourceHost == "docker.io") {
-		// 对于官方DockerHub，使用标准格式
-		srcImageRef = fmt.Sprintf("docker://%s:%s", sourceImage, sourceTag)
+	if sourceRegistry.registryType == "dockerhub" && (strings.Contains(sourceRegistry.registryURL, "docker.io") || strings.Contains(sourceRegistry.registryURL, "registry-1.docker.io")) {
+		srcImageRef = fmt.Sprintf("%s:%s", sourceImage, sourceTag)
 	} else {
-		// 对于其他仓库，包含完整域名
-		srcImageRef = fmt.Sprintf("docker://%s/%s:%s", sourceHost, sourceImage, sourceTag)
+		sourceHost := strings.TrimPrefix(sourceRegistry.registryURL, "https://")
+		sourceHost = strings.TrimPrefix(sourceHost, "http://")
+		srcImageRef = fmt.Sprintf("%s/%s:%s", sourceHost, sourceImage, sourceTag)
 	}
 
 	// 构建目标镜像引用
-	if strings.HasPrefix(destRegistry.registryURL, "https://") {
-		destHost = strings.TrimPrefix(destRegistry.registryURL, "https://")
-	}
-	// 如果url以http开头，则去掉http
-	if strings.HasPrefix(destRegistry.registryURL, "http://") {
-		destHost = strings.TrimPrefix(destRegistry.registryURL, "http://")
-	}
-	if destRegistry.registryType == "dockerhub" && (destHost == "registry-1.docker.io" || destHost == "docker.io") {
-		// 对于官方DockerHub，使用标准格式
-		destImageRef = fmt.Sprintf("docker://%s:%s", destImage, destTag)
+	if destRegistry.registryType == "dockerhub" && (strings.Contains(destRegistry.registryURL, "docker.io") || strings.Contains(destRegistry.registryURL, "registry-1.docker.io")) {
+		destImageRef = fmt.Sprintf("%s:%s", destImage, destTag)
 	} else {
-		// 对于其他仓库，包含完整域名
-		destImageRef = fmt.Sprintf("docker://%s/%s:%s", destHost, destImage, destTag)
+		destHost := strings.TrimPrefix(destRegistry.registryURL, "https://")
+		destHost = strings.TrimPrefix(destHost, "http://")
+		destImageRef = fmt.Sprintf("%s/%s:%s", destHost, destImage, destTag)
 	}
 
 	log.Printf("开始拷贝镜像: %s -> %s", srcImageRef, destImageRef)
@@ -611,68 +549,37 @@ func PullAndPushImage(ctx context.Context, sourceRegistry, destRegistry *Registr
 	log.Printf("目标注册表: %s (类型: %s)", destRegistry.registryURL, destRegistry.registryType)
 
 	// 解析镜像引用
-	srcRef, err := alltransports.ParseImageName(srcImageRef)
+	srcRef, err := name.ParseReference(srcImageRef)
 	if err != nil {
 		return fmt.Errorf("解析源镜像引用失败: %v", err)
 	}
 
-	destRef, err := alltransports.ParseImageName(destImageRef)
+	destRef, err := name.ParseReference(destImageRef)
 	if err != nil {
 		return fmt.Errorf("解析目标镜像引用失败: %v", err)
 	}
 
-	// 创建策略上下文
-	policyContext, err := signature.NewPolicyContext(&signature.Policy{Default: []signature.PolicyRequirement{signature.NewPRInsecureAcceptAnything()}})
-	if err != nil {
-		return fmt.Errorf("创建策略上下文失败: %v", err)
-	}
-	defer policyContext.Destroy()
-
-	// 创建拷贝选项
-	copyOptions := &copy.Options{
-		SourceCtx:      sourceRegistry.sysCtx,
-		DestinationCtx: destRegistry.sysCtx,
-		ReportWriter:   nil, // 可以添加进度报告
-	}
-
-	// 检查源镜像认证配置
-	if sourceRegistry.sysCtx.DockerAuthConfig != nil {
-		log.Printf("源注册表使用认证 (用户: %s， 密码：%s)", sourceRegistry.sysCtx.DockerAuthConfig.Username, sourceRegistry.sysCtx.DockerAuthConfig.Password)
-	} else {
-		log.Printf("源注册表使用匿名访问")
-	}
-
-	// 检查目标镜像认证配置
-	if destRegistry.sysCtx.DockerAuthConfig != nil {
-		log.Printf("目标注册表使用认证  (用户: %s， 密码：%s)", destRegistry.sysCtx.DockerAuthConfig.Username, destRegistry.sysCtx.DockerAuthConfig.Password)
-	} else {
-		log.Printf("目标注册表使用匿名访问")
-	}
-	// 执行镜像拷贝
-	log.Printf("正在执行镜像拷贝...")
-
-	// 先测试源镜像连接
+	// 测试源镜像连接
 	log.Printf("测试源镜像连接...")
-	srcImageSource, err := srcRef.NewImageSource(ctx, sourceRegistry.sysCtx)
+	_, err = remote.Image(srcRef, sourceRegistry.options...)
 	if err != nil {
 		return fmt.Errorf("无法连接到源镜像: %v", err)
 	}
-	srcImageSource.Close()
 	log.Printf("源镜像连接测试成功")
 
-	// 再测试目标仓库连接
-	log.Printf("测试目标仓库连接...")
-	destImageDest, err := destRef.NewImageDestination(ctx, destRegistry.sysCtx)
-	if err != nil {
-		return fmt.Errorf("无法连接到目标仓库: %v", err)
-	}
-	destImageDest.Close()
-	log.Printf("目标仓库连接测试成功")
+	// 使用 crane 进行镜像拷贝
+	log.Printf("正在执行镜像拷贝...")
 
-	// 开始实际拷贝
-	_, err = copy.Image(ctx, policyContext, destRef, srcRef, copyOptions)
+	// 获取源镜像
+	img, err := remote.Image(srcRef, sourceRegistry.options...)
 	if err != nil {
-		return fmt.Errorf("拷贝镜像失败: %v", err)
+		return fmt.Errorf("获取源镜像失败: %v", err)
+	}
+
+	// 推送到目标注册表
+	err = remote.Write(destRef, img, destRegistry.options...)
+	if err != nil {
+		return fmt.Errorf("推送镜像到目标注册表失败: %v", err)
 	}
 
 	log.Printf("成功同步镜像: %s:%s -> %s:%s", sourceImage, sourceTag, destImage, destTag)
