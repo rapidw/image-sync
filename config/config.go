@@ -29,12 +29,21 @@ type ImageMapping struct {
 	Destination string `yaml:"destination"`
 }
 
+// ProjectMapping 定义项目映射关系
+type ProjectMapping struct {
+	Source      string `yaml:"source"`      // 源项目名称
+	Destination string `yaml:"destination"` // 目标项目名称
+}
+
 // Config 总体配置结构
 type Config struct {
-	SourceRegistry      RegistryConfig `yaml:"sourceRegistry"`
-	DestinationRegistry RegistryConfig `yaml:"destinationRegistry"`
-	Images              []ImageMapping `yaml:"images"`
-	Schedule            string         `yaml:"schedule"` // Cron表达式
+	Mode                string           `yaml:"mode,omitempty"`     // 同步模式: image, project
+	Projects            []ProjectMapping `yaml:"projects,omitempty"` // 项目映射列表（project模式使用）
+	SourceRegistry      RegistryConfig   `yaml:"sourceRegistry"`
+	DestinationRegistry RegistryConfig   `yaml:"destinationRegistry"`
+	Images              []ImageMapping   `yaml:"images"`
+	TagFilter           []string         `yaml:"tagFilter,omitempty"` // 标签过滤器，正则表达式列表
+	Schedule            string           `yaml:"schedule"`            // Cron表达式
 }
 
 // LoadConfig 从文件加载配置
@@ -59,6 +68,16 @@ func LoadConfig(path string) (*Config, error) {
 
 // validateConfig 验证配置有效性
 func validateConfig(config *Config) error {
+	// 设置默认模式
+	if config.Mode == "" {
+		config.Mode = "image"
+	}
+
+	// 验证模式
+	if config.Mode != "image" && config.Mode != "project" {
+		return fmt.Errorf("模式必须是 'image' 或 'project'")
+	}
+
 	// 检查源注册表
 	if config.SourceRegistry.URL == "" {
 		return fmt.Errorf("源注册表 URL 不能为空")
@@ -69,9 +88,35 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("目标注册表 URL 不能为空")
 	}
 
-	// 检查镜像映射
-	if len(config.Images) == 0 {
-		return fmt.Errorf("至少需要一个镜像映射")
+	// project模式的特殊验证
+	if config.Mode == "project" {
+		if config.SourceRegistry.Type != "harbor" {
+			return fmt.Errorf("project模式要求源注册表类型必须是harbor")
+		}
+		if config.DestinationRegistry.Type != "harbor" {
+			return fmt.Errorf("project模式要求目标注册表类型必须是harbor")
+		}
+		if len(config.Projects) == 0 {
+			return fmt.Errorf("project模式需要指定至少一个项目映射")
+		}
+
+		// 验证每个项目映射
+		for i, project := range config.Projects {
+			if project.Source == "" {
+				return fmt.Errorf("第%d个项目映射的源项目名称不能为空", i+1)
+			}
+			// 如果没有指定目标项目名称，使用源项目名称
+			if project.Destination == "" {
+				config.Projects[i].Destination = project.Source
+			}
+		}
+	}
+
+	// image模式需要检查镜像映射
+	if config.Mode == "image" {
+		if len(config.Images) == 0 {
+			return fmt.Errorf("image模式至少需要一个镜像映射")
+		}
 	}
 
 	// 检查调度表达式
@@ -85,6 +130,7 @@ func validateConfig(config *Config) error {
 // SaveDefaultConfig 保存默认配置
 func SaveDefaultConfig(path string) error {
 	defaultConfig := Config{
+		Mode: "image", // 默认为image模式
 		SourceRegistry: RegistryConfig{
 			URL: "https://registry.example.com",
 			Auth: AuthConfig{
@@ -110,6 +156,11 @@ func SaveDefaultConfig(path string) error {
 				Source:      "redis",
 				Destination: "backup/redis",
 			},
+		},
+		TagFilter: []string{
+			"^v?\\d+\\.\\d+\\.\\d+$", // 匹配语义化版本标签，如 1.0.0 或 v1.0.0
+			"^latest$",               // 匹配 latest 标签
+			"^\\d+\\.\\d+$",          // 匹配简化版本号，如 1.0
 		},
 		Schedule: "0 0 * * *", // 每天午夜执行
 	}

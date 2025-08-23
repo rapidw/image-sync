@@ -58,6 +58,7 @@ func main() {
 		flag.Usage()
 		return
 	}
+
 	// 显示版本信息
 	if showVersion {
 		fmt.Println("Docker Image Sync Tool v1.0.0")
@@ -79,10 +80,26 @@ func main() {
 
 		log.Printf("默认配置文件已保存到: %s", absPath)
 		return
-	} // 加载配置文件
+	}
+
+	// 加载配置文件
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("加载配置文件失败: %v", err)
+	}
+
+	// 打印标签过滤器信息（如果配置了）
+	if len(cfg.TagFilter) > 0 {
+		log.Printf("已配置标签过滤器: %v", cfg.TagFilter)
+	}
+
+	// 打印同步模式信息
+	log.Printf("同步模式: %s", cfg.Mode)
+	if cfg.Mode == "project" {
+		log.Printf("项目映射数量: %d", len(cfg.Projects))
+		for i, project := range cfg.Projects {
+			log.Printf("  项目 %d: %s → %s", i+1, project.Source, project.Destination)
+		}
 	}
 
 	// 创建调度器
