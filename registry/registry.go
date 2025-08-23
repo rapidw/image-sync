@@ -614,7 +614,7 @@ func (r *RegistryClient) GetNewestTagsForEachFilter(image string, filters []stri
 		filters = []string{".*"}
 	}
 
-	log.Printf("正在获取镜像 %s 的所有标签信息（一次性获取用于多个过滤器）", image)
+	log.Printf("正在获取镜像 %s 的所有标签信息", image)
 
 	// 获取所有标签的信息
 	allTagsInfo, err := r.getAllTagsWithTimestamps(image)
