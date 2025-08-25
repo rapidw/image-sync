@@ -5,18 +5,11 @@ import (
 	"time"
 )
 
-// FormatTimeForLog 将UTC时间转换为北京时间并格式化用于日志显示
+// FormatTimeForLog 将时间转换为系统本地时区并格式化用于日志显示
 func FormatTimeForLog(t time.Time) string {
-	// 转换为北京时间 (UTC+8)
-	beijingLocation, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		// 如果加载时区失败，手动添加8小时
-		beijingTime := t.Add(8 * time.Hour)
-		return beijingTime.Format("2006-01-02 15:04:05 +0800 CST")
-	}
-
-	beijingTime := t.In(beijingLocation)
-	return beijingTime.Format("2006-01-02 15:04:05 -0700 MST")
+	// 转换为系统本地时区
+	localTime := t.Local()
+	return localTime.Format("2006-01-02 15:04:05")
 }
 
 // ParseTimestamp 解析时间戳的通用函数
